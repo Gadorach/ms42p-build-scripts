@@ -1,0 +1,99 @@
+#!/bin/sh
+set -u
+. /usr/lib/fwupdate/common.sh
+
+usage() {
+    cat <<'USAGE'
+usage: fw_update_tftp --server HOST --file REMOTE [options]
+  --checksum-file REMOTE   defaults to REMOTE.sha256
+  --port PORT              defaults to 69
+  --version VERSION
+  --overlay POLICY
+  --yes --force --verify-only --dry-run
+USAGE
+}
+
+SERVER=""; REMOTE=""; REMOTE_SHA=""; PORT=69; VERSION=""; OVERLAY=preserve
+YES=0; FORCE=0; VERIFY_ONLY=0; DRY_RUN=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --server) [ "$#" -ge 2 ] || fw_die "--server requires a value"; SERVER=$2; shift 2 ;;
+        --file) [ "$#" -ge 2 ] || fw_die "--file requires a value"; REMOTE=$2; shift 2 ;;
+        --checksum-file) [ "$#" -ge 2 ] || fw_die "--checksum-file requires a value"; REMOTE_SHA=$2; shift 2 ;;
+        --port) [ "$#" -ge 2 ] || fw_die "--port requires a value"; PORT=$2; shift 2 ;;
+        --version) [ "$#" -ge 2 ] || fw_die "--version requires a value"; VERSION=$2; shift 2 ;;
+        --overlay) [ "$#" -ge 2 ] || fw_die "--overlay requires a value"; OVERLAY=$2; shift 2 ;;
+        --yes) YES=1; shift ;;
+        --force) FORCE=1; shift ;;
+        --verify-only) VERIFY_ONLY=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) fw_die "unknown option: $1" ;;
+    esac
+done
+[ -n "$SERVER" ] && [ -n "$REMOTE" ] || { usage >&2; exit 2; }
+case "$PORT" in ''|*[!0-9]*) fw_die "TFTP port must be numeric" ;; esac
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || fw_die "invalid TFTP port: $PORT"
+safe_remote_path "$REMOTE" || fw_die "unsafe TFTP firmware path"
+[ -n "$REMOTE_SHA" ] || REMOTE_SHA="$REMOTE.sha256"
+safe_remote_path "$REMOTE_SHA" || fw_die "unsafe TFTP checksum path"
+filename=$(basename "$REMOTE")
+safe_remote_filename "$filename" || fw_die "unsafe firmware filename"
+
+check_work_base_ram
+
+WORK="$FWUPDATE_WORK_BASE/fwupdate-tftp.$$"
+mkdir -p "$WORK"
+chmod 700 "$WORK"
+FWUPDATE_TRANSPORT_WORK=$WORK
+export FWUPDATE_TRANSPORT_WORK
+acquire_lock
+trap 'rm -rf "$WORK"; release_lock' EXIT
+local_fw="$WORK/$filename"
+local_sha="$WORK/$filename.sha256"
+FWUPDATE_SOURCE="tftp://$SERVER:$PORT/$REMOTE"
+FWUPDATE_FIRMWARE=$filename
+export FWUPDATE_SOURCE FWUPDATE_FIRMWARE
+
+fetch_tftp() {
+    remote=$1
+    output=$2
+    rm -f "$output.part"
+    if command -v curl >/dev/null 2>&1; then
+        curl --fail --show-error --silent --proto '=tftp' \
+            --retry 3 --connect-timeout 15 --max-time 900 \
+            --output "$output.part" "tftp://$SERVER:$PORT/${remote#/}" || {
+                rm -f "$output.part"
+                return 1
+            }
+    else
+        command -v tftp >/dev/null 2>&1 || fw_die "no TFTP client is installed"
+        attempt=1
+        while [ "$attempt" -le 3 ]; do
+            if command -v timeout >/dev/null 2>&1; then
+                timeout 900 tftp -g -l "$output.part" -r "$remote" "$SERVER" "$PORT" && break
+            else
+                tftp -g -l "$output.part" -r "$remote" "$SERVER" "$PORT" && break
+            fi
+            rm -f "$output.part"
+            attempt=$((attempt + 1))
+        done
+        [ -f "$output.part" ] || return 1
+    fi
+    mv -f "$output.part" "$output"
+}
+
+status_write downloading firmware 8 "Downloading $REMOTE by TFTP"
+fetch_tftp "$REMOTE" "$local_fw" || fw_die "TFTP firmware download failed"
+status_write downloading checksum 12 "Downloading $REMOTE_SHA by TFTP"
+fetch_tftp "$REMOTE_SHA" "$local_sha" || fw_die "TFTP checksum download failed"
+
+set -- fw_update --checksum "$local_sha" --overlay "$OVERLAY" --source "$FWUPDATE_SOURCE"
+[ -n "$VERSION" ] && set -- "$@" --version "$VERSION"
+[ "$YES" -eq 1 ] && set -- "$@" --yes
+[ "$FORCE" -eq 1 ] && set -- "$@" --force
+[ "$VERIFY_ONLY" -eq 1 ] && set -- "$@" --verify-only
+[ "$DRY_RUN" -eq 1 ] && set -- "$@" --dry-run
+set -- "$@" "$local_fw"
+trap - EXIT
+exec "$@"

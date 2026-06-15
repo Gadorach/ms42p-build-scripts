@@ -1,0 +1,25 @@
+config BR2_PACKAGE_FWUPDATE
+	bool "postmerkOS MS42/MS42P firmware updater"
+	depends on BR2_USE_MMU
+	select BR2_PACKAGE_MTD
+	select BR2_PACKAGE_MTD_FLASH_ERASE
+	select BR2_PACKAGE_MTD_MKFSJFFS2
+	help
+	  Safe in-system updater for the MS42/MS42P RedBoot flash layout.
+	  It updates only the SquashFS and optional JFFS2 overlay partitions.
+
+config BR2_PACKAGE_FWUPDATE_CURL
+	bool "curl HTTP(S)/SFTP transport support"
+	default y
+	depends on BR2_PACKAGE_FWUPDATE
+	select BR2_PACKAGE_MBEDTLS
+	select BR2_PACKAGE_LIBSSH2
+	select BR2_PACKAGE_LIBSSH2_MBEDTLS
+	select BR2_PACKAGE_LIBCURL
+	select BR2_PACKAGE_LIBCURL_CURL
+	select BR2_PACKAGE_LIBCURL_EXTRA_PROTOCOLS_FEATURES
+	select BR2_PACKAGE_LIBCURL_MBEDTLS
+	select BR2_PACKAGE_CA_CERTIFICATES
+	help
+	  Adds HTTPS certificate verification and SFTP support through curl,
+	  mbed TLS and libssh2. Plain HTTP and TFTP can work with BusyBox alone.

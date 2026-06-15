@@ -1,0 +1,352 @@
+#!/bin/sh
+set -u
+
+. /usr/lib/fwupdate/common.sh
+
+usage() {
+    cat <<'USAGE'
+usage: fw_update [options] FIRMWARE
+
+Installs an already-downloaded MS42/MS42P firmware image or SquashFS.
+The kernel and bootloader partitions are never modified.
+
+Options:
+  --checksum FILE       SHA-256 sidecar; must name FIRMWARE exactly
+  --sha256 HASH         expected SHA-256 instead of a sidecar
+  --overlay POLICY      preserve (default), migrate, reset, or image
+  --version VERSION     version reported by the transport/catalog
+  --source TEXT         source reported in status output
+  --yes                 do not ask for confirmation
+  --force               allow reinstalling the reported current version
+  --verify-only         validate everything without changing flash
+  --dry-run             prepare images/backups, but do not stop services
+  --help
+
+Overlay policies:
+  preserve  Do not write JFFS2; retain it byte-for-byte.
+  migrate   Build a clean JFFS2 image containing preserve.list paths.
+  reset     Build and flash a completely clean JFFS2 overlay.
+  image     Flash the 5 MiB JFFS2 region embedded in a 16 MiB full image.
+USAGE
+}
+
+CHECKSUM=""
+EXPECTED_HASH=""
+OVERLAY_POLICY=preserve
+VERSION=""
+SOURCE=local
+ASSUME_YES=0
+FORCE=0
+VERIFY_ONLY=0
+DRY_RUN=0
+FIRMWARE=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --checksum) [ "$#" -ge 2 ] || fw_die "--checksum requires a value"; CHECKSUM=$2; shift 2 ;;
+        --sha256) [ "$#" -ge 2 ] || fw_die "--sha256 requires a value"; EXPECTED_HASH=$2; shift 2 ;;
+        --overlay) [ "$#" -ge 2 ] || fw_die "--overlay requires a value"; OVERLAY_POLICY=$2; shift 2 ;;
+        --version) [ "$#" -ge 2 ] || fw_die "--version requires a value"; VERSION=$2; shift 2 ;;
+        --source) [ "$#" -ge 2 ] || fw_die "--source requires a value"; SOURCE=$2; shift 2 ;;
+        --yes) ASSUME_YES=1; shift ;;
+        --force) FORCE=1; shift ;;
+        --verify-only) VERIFY_ONLY=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) fw_die "unknown option: $1" ;;
+        *)
+            [ -z "$FIRMWARE" ] || fw_die "only one firmware file may be supplied"
+            FIRMWARE=$1
+            shift
+            ;;
+    esac
+done
+[ -n "$FIRMWARE" ] || { usage >&2; exit 2; }
+[ -f "$FIRMWARE" ] || fw_die "firmware file not found: $FIRMWARE"
+[ "$(id -u)" -eq 0 ] || fw_die "fw_update must run as root"
+
+case "$OVERLAY_POLICY" in
+    preserve|migrate|reset|image) ;;
+    *) fw_die "invalid overlay policy: $OVERLAY_POLICY" ;;
+esac
+
+need_cmd awk
+need_cmd dd
+need_cmd hexdump
+need_cmd sha256sum
+need_cmd head
+need_cmd fuser
+need_cmd mountpoint
+need_cmd umount
+case "$OVERLAY_POLICY" in
+    migrate|reset) need_cmd mkfs.jffs2 ;;
+esac
+
+FWUPDATE_SOURCE=$SOURCE
+FWUPDATE_FIRMWARE=$(basename "$FIRMWARE")
+export FWUPDATE_SOURCE FWUPDATE_FIRMWARE
+check_work_base_ram
+acquire_lock
+trap 'release_lock' EXIT
+
+status_write validating checksum 5 "Validating checksum"
+if [ -n "$CHECKSUM" ] && [ -n "$EXPECTED_HASH" ]; then
+    fw_die "use either --checksum or --sha256, not both"
+elif [ -n "$CHECKSUM" ]; then
+    verify_sidecar "$FIRMWARE" "$CHECKSUM"
+elif [ -n "$EXPECTED_HASH" ]; then
+    verify_expected_hash "$FIRMWARE" "$EXPECTED_HASH"
+elif [ -f "$FIRMWARE.sha256" ]; then
+    verify_sidecar "$FIRMWARE" "$FIRMWARE.sha256"
+else
+    fw_die "a matching SHA-256 sidecar or --sha256 value is required"
+fi
+
+status_write validating platform 10 "Checking board and MTD layout"
+check_board
+check_mtd_layout
+
+CURRENT_VERSION=""
+if [ -f /etc/lsb-release ]; then
+    CURRENT_VERSION=$(awk -F= '/^DISTRIB_RELEASE=/{gsub(/"/, "", $2); print $2; exit}' /etc/lsb-release)
+fi
+if [ -n "$VERSION" ] && [ "$VERSION" = "$CURRENT_VERSION" ] && [ "$FORCE" -ne 1 ]; then
+    fw_die "firmware version $VERSION is already installed; use --force to reinstall"
+fi
+
+AVAILABLE_KB=$(df -Pk "$FWUPDATE_WORK_BASE" | awk 'NR == 2 {print $4}')
+case "$OVERLAY_POLICY" in
+    preserve) REQUIRED_KB=20000 ;;
+    *) REQUIRED_KB=32000 ;;
+esac
+[ -n "$AVAILABLE_KB" ] && [ "$AVAILABLE_KB" -ge "$REQUIRED_KB" ] || \
+    fw_die "insufficient tmpfs space: need at least ${REQUIRED_KB} KiB free"
+
+WORK="$FWUPDATE_WORK_BASE/fwupdate.$$"
+mkdir -p "$WORK"
+chmod 700 "$WORK"
+cleanup_work() {
+    rm -rf "$WORK" 2>/dev/null || true
+    cleanup_transport_work
+}
+trap 'cleanup_work; release_lock' EXIT
+
+IMAGE_SIZE=$(file_size "$FIRMWARE")
+IMAGE_TYPE=""
+ROOT_IMAGE=""
+OVERLAY_IMAGE=""
+
+status_write validating image 15 "Validating firmware structure"
+if [ "$IMAGE_SIZE" -eq "$FWUPDATE_FULL_IMAGE_SIZE" ] && \
+   [ "$(read_magic "$FIRMWARE" "$FWUPDATE_KERNEL_OFFSET" 4)" = "SPIM" ] && \
+   [ "$(read_magic "$FIRMWARE" "$FWUPDATE_ROOTFS_OFFSET" 4)" = "hsqs" ]; then
+    IMAGE_TYPE=full
+    ROOT_IMAGE="$WORK/rootfs.region"
+    dd if="$FIRMWARE" of="$ROOT_IMAGE" bs=1M skip=3 count=8 2>/dev/null || \
+        fw_die "failed to extract SquashFS region"
+    [ "$(file_size "$ROOT_IMAGE")" -eq "$FWUPDATE_ROOTFS_SIZE" ] || \
+        fw_die "extracted SquashFS region has the wrong size"
+else
+    [ "$(read_magic "$FIRMWARE" 0 4)" = "hsqs" ] || \
+        fw_die "input is neither a valid full MS42/MS42P image nor a SquashFS"
+    [ "$IMAGE_SIZE" -gt 0 ] && [ "$IMAGE_SIZE" -le "$FWUPDATE_ROOTFS_SIZE" ] || \
+        fw_die "SquashFS exceeds the 8 MiB partition"
+    IMAGE_TYPE=squashfs
+    ROOT_IMAGE="$WORK/rootfs.squashfs"
+    cp "$FIRMWARE" "$ROOT_IMAGE" || fw_die "failed to stage SquashFS in tmpfs"
+fi
+
+ROOT_IMAGE_SIZE=$(file_size "$ROOT_IMAGE")
+CANDIDATE_ROOT_HASH=$(sha256sum "$ROOT_IMAGE" | awk '{print $1}')
+CURRENT_ROOT_HASH=$(head -c "$ROOT_IMAGE_SIZE" "/dev/$ROOT_MTD" 2>/dev/null | sha256sum | awk '{print $1}')
+if [ "$CANDIDATE_ROOT_HASH" = "$CURRENT_ROOT_HASH" ] && [ "$FORCE" -ne 1 ]; then
+    fw_die "the SquashFS content already matches the installed firmware; use --force to reinstall"
+fi
+
+make_overlay_tree() {
+    tree=$1
+    mkdir -p "$tree/.upper/etc" "$tree/.work/etc" \
+             "$tree/.upper/root" "$tree/.work/root"
+}
+
+build_overlay_image() {
+    root=$1
+    out=$2
+    mkfs.jffs2 --pad="$FWUPDATE_OVERLAY_SIZE" -l -n \
+        -X lzo -x zlib -y 40:lzo -r "$root" -o "$out" >/dev/null || \
+        fw_die "failed to generate JFFS2 image"
+    [ "$(file_size "$out")" -eq "$FWUPDATE_OVERLAY_SIZE" ] || \
+        fw_die "generated JFFS2 image has the wrong size"
+    [ "$(read_hex "$out" 0 2)" = "8519" ] || \
+        fw_die "generated JFFS2 image has an invalid magic value"
+}
+
+case "$OVERLAY_POLICY" in
+    preserve)
+        ;;
+    image)
+        [ "$IMAGE_TYPE" = full ] || fw_die "--overlay image requires a 16 MiB full image"
+        OVERLAY_IMAGE="$WORK/overlay.region"
+        dd if="$FIRMWARE" of="$OVERLAY_IMAGE" bs=1M skip=11 count=5 2>/dev/null || \
+            fw_die "failed to extract JFFS2 region"
+        [ "$(file_size "$OVERLAY_IMAGE")" -eq "$FWUPDATE_OVERLAY_SIZE" ] || \
+            fw_die "extracted JFFS2 region has the wrong size"
+        [ "$(read_hex "$OVERLAY_IMAGE" 0 2)" = "8519" ] || \
+            fw_die "embedded JFFS2 region has an invalid magic value"
+        ;;
+    reset)
+        make_overlay_tree "$WORK/overlay-root"
+        OVERLAY_IMAGE="$WORK/overlay.region"
+        build_overlay_image "$WORK/overlay-root" "$OVERLAY_IMAGE"
+        ;;
+    migrate)
+        make_overlay_tree "$WORK/overlay-root"
+        [ -f "$FWUPDATE_PRESERVE_FILE" ] || fw_die "preserve list not found: $FWUPDATE_PRESERVE_FILE"
+        while IFS= read -r src || [ -n "$src" ]; do
+            case "$src" in ""|\#*) continue ;; esac
+            case "$src" in
+                /etc/*|/root/*) ;;
+                *) fw_die "invalid preserve path: $src" ;;
+            esac
+            [ -e "$src" ] || [ -L "$src" ] || continue
+            case "$src" in
+                /etc/*) dest="$WORK/overlay-root/.upper/etc/${src#/etc/}" ;;
+                /root/*) dest="$WORK/overlay-root/.upper/root/${src#/root/}" ;;
+            esac
+            mkdir -p "$(dirname "$dest")"
+            cp -a "$src" "$dest" || fw_die "failed to preserve $src"
+        done < "$FWUPDATE_PRESERVE_FILE"
+        OVERLAY_IMAGE="$WORK/overlay.region"
+        build_overlay_image "$WORK/overlay-root" "$OVERLAY_IMAGE"
+        ;;
+esac
+
+# Transport wrappers place downloads in their own tmpfs directory. All required
+# bytes have now been copied/extracted into this updater's private work area.
+cleanup_transport_work
+
+ROOT_BACKUP="$WORK/rootfs.backup"
+OVERLAY_BACKUP=""
+[ -n "$OVERLAY_IMAGE" ] && OVERLAY_BACKUP="$WORK/overlay.backup"
+
+FLASH_HELPER=/usr/libexec/fwupdate/fwflash
+[ -x "$FLASH_HELPER" ] || fw_die "RAM flashing helper is missing: $FLASH_HELPER"
+cp "$FLASH_HELPER" "$WORK/fwflash" || fw_die "failed to copy flashing helper to tmpfs"
+chmod 700 "$WORK/fwflash"
+
+status_write ready confirm 30 "Firmware is validated and ready to install"
+printf '\nFirmware: %s\n' "$FIRMWARE"
+printf 'SHA-256: %s\n' "$FWUPDATE_SHA256"
+printf 'Input type: %s\n' "$IMAGE_TYPE"
+printf 'Overlay policy: %s\n' "$OVERLAY_POLICY"
+printf 'Current version: %s\n' "${CURRENT_VERSION:-unknown}"
+printf 'New version: %s\n' "${VERSION:-unknown}"
+printf '\nThe switch will stop network services and reboot after flashing.\n'
+printf 'Loss of power while the SquashFS partition is being written can require hardware recovery.\n\n'
+
+if [ "$VERIFY_ONLY" -eq 1 ]; then
+    status_write success verified 100 "Firmware and flash layout validation succeeded"
+    exit 0
+fi
+if [ "$DRY_RUN" -eq 1 ]; then
+    status_write success dry_run 100 "Dry run completed; no services stopped and no flash written"
+    exit 0
+fi
+if [ "$ASSUME_YES" -ne 1 ]; then
+    printf 'Type UPGRADE to continue: '
+    read -r answer
+    [ "$answer" = UPGRADE ] || fw_die "upgrade cancelled"
+fi
+
+status_write preparing quiesce 35 "Stopping services and unmounting the writable overlay"
+trap '' HUP
+cd /tmp || fw_die "cannot change directory to /tmp"
+sync
+
+# Stop processes that may hold files in /etc, /root, or the SquashFS lower layer.
+for proc in configd uhttpd chronyd chrony syslogd klogd crond ntpd dhcpclient; do
+    killall "$proc" >/dev/null 2>&1 || true
+done
+# Stop SSH last. The updater ignores SIGHUP and continues from tmpfs.
+killall dropbear >/dev/null 2>&1 || true
+sleep 2
+
+# Quiesce any remaining userspace process, including background board scripts
+# that are not known by a stable process name. PID 1 is left alone; this shell
+# is about to exec the static helper from tmpfs.
+quiesce_remaining_userspace() {
+    signal=$1
+    for procdir in /proc/[0-9]*; do
+        pid=${procdir#/proc/}
+        case "$pid" in 1|$$) continue ;; esac
+        kill "-$signal" "$pid" >/dev/null 2>&1 || true
+    done
+}
+quiesce_remaining_userspace TERM
+sleep 1
+quiesce_remaining_userspace KILL
+
+unmount_one() {
+    target=$1
+    if mountpoint -q "$target" 2>/dev/null; then
+        umount "$target" >/dev/null 2>&1 || {
+            fuser -km "$target" >/dev/null 2>&1 || true
+            sleep 1
+            umount "$target" >/dev/null 2>&1 || return 1
+        }
+    fi
+    return 0
+}
+
+# Unmount both overlays even when JFFS2 is preserved. This removes references
+# to the SquashFS lower layer before the rootfs partition is erased.
+if ! unmount_one /root || ! unmount_one /etc || ! unmount_one /overlay; then
+    status_write error unmount 100 "Could not unmount overlay filesystems; rebooting without flashing"
+    sync
+    sleep 2
+    reboot -f >/dev/null 2>&1 || echo b > /proc/sysrq-trigger
+    exit 1
+fi
+
+# Take rollback snapshots only after writers are stopped and JFFS2 is
+# unmounted, so a failed transaction restores a consistent overlay image.
+status_write preparing backup 38 "Backing up current flash partitions for rollback"
+if ! dd if="/dev/$ROOT_MTD" of="$ROOT_BACKUP" bs=1M count=8 2>/dev/null || \
+   [ "$(file_size "$ROOT_BACKUP" 2>/dev/null || echo 0)" -ne "$FWUPDATE_ROOTFS_SIZE" ]; then
+    status_write error backup 100 "Could not back up SquashFS; rebooting without flashing"
+    sync
+    sleep 2
+    reboot -f >/dev/null 2>&1 || echo b > /proc/sysrq-trigger
+    exit 1
+fi
+if [ -n "$OVERLAY_IMAGE" ]; then
+    if ! dd if="/dev/$OVERLAY_MTD" of="$OVERLAY_BACKUP" bs=1M count=5 2>/dev/null || \
+       [ "$(file_size "$OVERLAY_BACKUP" 2>/dev/null || echo 0)" -ne "$FWUPDATE_OVERLAY_SIZE" ]; then
+        status_write error backup 100 "Could not back up JFFS2; rebooting without flashing"
+        sync
+        sleep 2
+        reboot -f >/dev/null 2>&1 || echo b > /proc/sysrq-trigger
+        exit 1
+    fi
+fi
+sync
+
+status_write flashing handoff 40 "Handing control to the RAM-resident flashing helper"
+trap - EXIT
+
+set -- "$WORK/fwflash" \
+    --rootfs-image "$ROOT_IMAGE" \
+    --rootfs-mtd "/dev/$ROOT_MTD" \
+    --rootfs-backup "$ROOT_BACKUP" \
+    --status-file "$FWUPDATE_STATUS_FILE" \
+    --log-file /run/fwupdate/flash.log \
+    --source "$SOURCE" \
+    --firmware "$FWUPDATE_FIRMWARE"
+if [ -n "$OVERLAY_IMAGE" ]; then
+    set -- "$@" \
+        --overlay-image "$OVERLAY_IMAGE" \
+        --overlay-mtd "/dev/$OVERLAY_MTD" \
+        --overlay-backup "$OVERLAY_BACKUP"
+fi
+exec "$@"

@@ -1,0 +1,10 @@
+# Used only by: fw_update --overlay migrate
+# Paths must be inside /etc or /root. Missing paths are ignored.
+/etc/switch.json
+/etc/MERAKI_MAC
+/etc/boardinfo
+/etc/dropbear
+/etc/shadow
+/root/.ssh
+/etc/fwupdate/sources.conf
+/etc/fwupdate/preserve.list

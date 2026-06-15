@@ -1,0 +1,125 @@
+#!/bin/sh
+set -u
+. /usr/lib/fwupdate/common.sh
+
+usage() {
+    cat <<'USAGE'
+usage: fw_update_sftp --server HOST --file REMOTE [options]
+  --checksum-file REMOTE   defaults to REMOTE.sha256
+  --port PORT              defaults to 22
+  --user USER              defaults to anonymous
+  --password PASSWORD      defaults to an empty password
+  --password-file FILE     safer alternative to --password
+  --hostpubsha256 HASH     pin the SSH host public-key SHA-256
+  --known-hosts FILE       known_hosts file (default: /root/.ssh/known_hosts)
+  --insecure-host-key      skip SSH host-key verification (not recommended)
+  --version VERSION
+  --overlay POLICY
+  --yes --force --verify-only --dry-run
+USAGE
+}
+
+SERVER=""; REMOTE=""; REMOTE_SHA=""; PORT=22; USER=anonymous; PASSWORD=""
+PASSWORD_FILE=""; HOSTPUB=""; KNOWN_HOSTS=""; INSECURE=0; VERSION=""; OVERLAY=preserve
+YES=0; FORCE=0; VERIFY_ONLY=0; DRY_RUN=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --server) [ "$#" -ge 2 ] || fw_die "--server requires a value"; SERVER=$2; shift 2 ;;
+        --file) [ "$#" -ge 2 ] || fw_die "--file requires a value"; REMOTE=$2; shift 2 ;;
+        --checksum-file) [ "$#" -ge 2 ] || fw_die "--checksum-file requires a value"; REMOTE_SHA=$2; shift 2 ;;
+        --port) [ "$#" -ge 2 ] || fw_die "--port requires a value"; PORT=$2; shift 2 ;;
+        --user) [ "$#" -ge 2 ] || fw_die "--user requires a value"; USER=$2; shift 2 ;;
+        --password) [ "$#" -ge 2 ] || fw_die "--password requires a value"; PASSWORD=$2; shift 2 ;;
+        --password-file) [ "$#" -ge 2 ] || fw_die "--password-file requires a value"; PASSWORD_FILE=$2; shift 2 ;;
+        --hostpubsha256) [ "$#" -ge 2 ] || fw_die "--hostpubsha256 requires a value"; HOSTPUB=$2; shift 2 ;;
+        --known-hosts) [ "$#" -ge 2 ] || fw_die "--known-hosts requires a value"; KNOWN_HOSTS=$2; shift 2 ;;
+        --insecure-host-key) INSECURE=1; shift ;;
+        --version) [ "$#" -ge 2 ] || fw_die "--version requires a value"; VERSION=$2; shift 2 ;;
+        --overlay) [ "$#" -ge 2 ] || fw_die "--overlay requires a value"; OVERLAY=$2; shift 2 ;;
+        --yes) YES=1; shift ;;
+        --force) FORCE=1; shift ;;
+        --verify-only) VERIFY_ONLY=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) fw_die "unknown option: $1" ;;
+    esac
+done
+[ -n "$SERVER" ] && [ -n "$REMOTE" ] || { usage >&2; exit 2; }
+case "$PORT" in ''|*[!0-9]*) fw_die "SFTP port must be numeric" ;; esac
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || fw_die "invalid SFTP port: $PORT"
+command -v curl >/dev/null 2>&1 || fw_die "SFTP requires curl/libssh2 support"
+safe_remote_path "$REMOTE" || fw_die "unsafe SFTP firmware path"
+[ -n "$REMOTE_SHA" ] || REMOTE_SHA="$REMOTE.sha256"
+safe_remote_path "$REMOTE_SHA" || fw_die "unsafe SFTP checksum path"
+if [ -n "$PASSWORD_FILE" ]; then
+    [ -f "$PASSWORD_FILE" ] || fw_die "password file not found"
+    IFS= read -r PASSWORD < "$PASSWORD_FILE" || true
+fi
+if printf '%s' "$USER$PASSWORD" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    fw_die "SFTP credentials may not contain control characters"
+fi
+case "$USER" in *:*) fw_die "SFTP username may not contain a colon" ;; esac
+if [ "$INSECURE" -eq 0 ] && [ -z "$HOSTPUB" ]; then
+    [ -n "$KNOWN_HOSTS" ] || KNOWN_HOSTS=/root/.ssh/known_hosts
+    [ -f "$KNOWN_HOSTS" ] || \
+        fw_die "no SSH host-key pin or known_hosts file is available; use --hostpubsha256, --known-hosts, or explicitly --insecure-host-key"
+fi
+filename=$(basename "$REMOTE")
+safe_remote_filename "$filename" || fw_die "unsafe firmware filename"
+
+check_work_base_ram
+
+WORK="$FWUPDATE_WORK_BASE/fwupdate-sftp.$$"
+mkdir -p "$WORK"
+chmod 700 "$WORK"
+FWUPDATE_TRANSPORT_WORK=$WORK
+export FWUPDATE_TRANSPORT_WORK
+acquire_lock
+trap 'rm -rf "$WORK"; release_lock' EXIT
+SFTP_HOME="$WORK/home"
+mkdir -p "$SFTP_HOME/.ssh"
+chmod 700 "$SFTP_HOME" "$SFTP_HOME/.ssh"
+if [ -n "$KNOWN_HOSTS" ]; then
+    cp "$KNOWN_HOSTS" "$SFTP_HOME/.ssh/known_hosts" || fw_die "could not stage known_hosts"
+    chmod 600 "$SFTP_HOME/.ssh/known_hosts"
+fi
+local_fw="$WORK/$filename"
+local_sha="$WORK/$filename.sha256"
+FWUPDATE_SOURCE="sftp://$SERVER:$PORT/$REMOTE"
+FWUPDATE_FIRMWARE=$filename
+export FWUPDATE_SOURCE FWUPDATE_FIRMWARE
+
+curl_quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+fetch_sftp() {
+    remote=$1
+    output=$2
+    url="sftp://$SERVER:$PORT/${remote#/}"
+    rm -f "$output.part"
+    {
+        printf 'url = "%s"\n' "$(curl_quote "$url")"
+        printf 'output = "%s.part"\n' "$(curl_quote "$output")"
+        printf 'user = "%s:%s"\n' "$(curl_quote "$USER")" "$(curl_quote "$PASSWORD")"
+        printf 'fail\nshow-error\nsilent\nconnect-timeout = 15\nmax-time = 900\nretry = 3\n'
+        [ -n "$HOSTPUB" ] && printf 'hostpubsha256 = "%s"\n' "$(curl_quote "$HOSTPUB")"
+        [ "$INSECURE" -eq 1 ] && printf 'insecure\n'
+    } | HOME="$SFTP_HOME" curl --proto '=sftp' --config - || {
+        rm -f "$output.part"
+        fw_die "SFTP download failed: $remote"
+    }
+    mv -f "$output.part" "$output"
+}
+
+status_write downloading firmware 8 "Downloading $REMOTE by SFTP"
+fetch_sftp "$REMOTE" "$local_fw"
+status_write downloading checksum 12 "Downloading $REMOTE_SHA by SFTP"
+fetch_sftp "$REMOTE_SHA" "$local_sha"
+
+set -- fw_update --checksum "$local_sha" --overlay "$OVERLAY" --source "$FWUPDATE_SOURCE"
+[ -n "$VERSION" ] && set -- "$@" --version "$VERSION"
+[ "$YES" -eq 1 ] && set -- "$@" --yes
+[ "$FORCE" -eq 1 ] && set -- "$@" --force
+[ "$VERIFY_ONLY" -eq 1 ] && set -- "$@" --verify-only
+[ "$DRY_RUN" -eq 1 ] && set -- "$@" --dry-run
+set -- "$@" "$local_fw"
+trap - EXIT
+exec "$@"

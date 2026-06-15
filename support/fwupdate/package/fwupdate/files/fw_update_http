@@ -1,0 +1,186 @@
+#!/bin/sh
+set -u
+. /usr/lib/fwupdate/common.sh
+
+usage() {
+    cat <<'USAGE'
+usage: fw_update_http [options]
+
+With no selection options, collects all configured indexes and prompts for a
+firmware. Headless use should include --yes and one of --choice, --version,
+--file, or --url.
+
+Options:
+  --list                 list catalog only
+  --source NAME|BASEURL  restrict configured sources, or use a base URL
+  --choice NUMBER        select numbered catalog entry
+  --version VERSION      select matching version
+  --file FILENAME        select matching filename from the catalog/source
+  --url URL              direct firmware URL; sidecar defaults to URL.sha256
+  --checksum-url URL     checksum URL for --url
+  --overlay POLICY       preserve, migrate, reset, or image
+  --yes --force --verify-only --dry-run
+USAGE
+}
+
+MODE=install
+SOURCE_FILTER=""
+CHOICE=""
+VERSION=""
+SELECT_FILE=""
+DIRECT_URL=""
+CHECKSUM_URL=""
+OVERLAY=preserve
+YES=0
+FORCE=0
+VERIFY_ONLY=0
+DRY_RUN=0
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --list) MODE=list; shift ;;
+        --source) [ "$#" -ge 2 ] || fw_die "--source requires a value"; SOURCE_FILTER=$2; shift 2 ;;
+        --choice) [ "$#" -ge 2 ] || fw_die "--choice requires a value"; CHOICE=$2; shift 2 ;;
+        --version) [ "$#" -ge 2 ] || fw_die "--version requires a value"; VERSION=$2; shift 2 ;;
+        --file) [ "$#" -ge 2 ] || fw_die "--file requires a value"; SELECT_FILE=$2; shift 2 ;;
+        --url) [ "$#" -ge 2 ] || fw_die "--url requires a value"; DIRECT_URL=$2; shift 2 ;;
+        --checksum-url) [ "$#" -ge 2 ] || fw_die "--checksum-url requires a value"; CHECKSUM_URL=$2; shift 2 ;;
+        --overlay) [ "$#" -ge 2 ] || fw_die "--overlay requires a value"; OVERLAY=$2; shift 2 ;;
+        --yes) YES=1; shift ;;
+        --force) FORCE=1; shift ;;
+        --verify-only) VERIFY_ONLY=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) fw_die "unknown option: $1" ;;
+    esac
+done
+
+check_work_base_ram
+
+WORK="$FWUPDATE_WORK_BASE/fwupdate-http.$$"
+mkdir -p "$WORK"
+chmod 700 "$WORK"
+FWUPDATE_TRANSPORT_WORK=$WORK
+export FWUPDATE_TRANSPORT_WORK
+acquire_lock
+trap 'rm -rf "$WORK"; release_lock' EXIT
+CATALOG="$WORK/catalog.tsv"
+: > "$CATALOG"
+
+join_url() {
+    base=${1%/}
+    path=${2#/}
+    printf '%s/%s' "$base" "$path"
+}
+
+add_source() {
+    source_name=$1
+    base=$2
+    index_name=${3:-index.tsv}
+    case "$base" in http://*|https://*) ;; *) return 0 ;; esac
+    case "$source_name" in *[!A-Za-z0-9._-]*|"") return 0 ;; esac
+    index_file="$WORK/index.$$.${source_name}"
+    status_write checking catalog 2 "Checking firmware source $source_name" "$base"
+    if ! try_fetch_http_file "$(join_url "$base" "$index_name")" "$index_file"; then
+        printf 'warning: could not read firmware index from %s
+' "$base" >&2
+        return 0
+    fi
+    while IFS='|' read -r version target filename bytes description || [ -n "$version$target$filename$bytes$description" ]; do
+        case "$version" in ""|\#*) continue ;; esac
+        [ "$target" = "$FWUPDATE_PLATFORM" ] || continue
+        case "$version" in *[!A-Za-z0-9._+-]*) continue ;; esac
+        safe_remote_filename "$filename" || continue
+        printf '%s|%s|%s|%s|%s|%s\n' \
+            "$source_name" "$base" "$version" "$filename" "$bytes" "$description" >> "$CATALOG"
+    done < "$index_file"
+}
+
+if [ -n "$DIRECT_URL" ]; then
+    case "$DIRECT_URL" in http://*|https://*) ;; *) fw_die "--url must be HTTP or HTTPS" ;; esac
+    filename=$(basename "${DIRECT_URL%%\?*}")
+    safe_remote_filename "$filename" || fw_die "unsafe firmware filename in URL"
+    if [ -z "$CHECKSUM_URL" ]; then
+        case "$DIRECT_URL" in
+            *\?*) CHECKSUM_URL="${DIRECT_URL%%\?*}.sha256?${DIRECT_URL#*\?}" ;;
+            *) CHECKSUM_URL="$DIRECT_URL.sha256" ;;
+        esac
+    fi
+    selected_source=${DIRECT_URL%%\?*}
+    selected_version=$VERSION
+    firmware_url=$DIRECT_URL
+    checksum_url=$CHECKSUM_URL
+else
+    if [ -n "$SOURCE_FILTER" ]; then
+        case "$SOURCE_FILTER" in
+            http://*|https://*) add_source direct "$SOURCE_FILTER" index.tsv ;;
+            *)
+                [ -f "$FWUPDATE_SOURCES_FILE" ] || fw_die "source list not found: $FWUPDATE_SOURCES_FILE"
+                while IFS='|' read -r name base index || [ -n "$name$base$index" ]; do
+                    case "$name" in ""|\#*) continue ;; esac
+                    [ "$name" = "$SOURCE_FILTER" ] || continue
+                    add_source "$name" "$base" "${index:-index.tsv}"
+                done < "$FWUPDATE_SOURCES_FILE"
+                ;;
+        esac
+    else
+        [ -f "$FWUPDATE_SOURCES_FILE" ] || fw_die "source list not found: $FWUPDATE_SOURCES_FILE"
+        while IFS='|' read -r name base index || [ -n "$name$base$index" ]; do
+            case "$name" in ""|\#*) continue ;; esac
+            add_source "$name" "$base" "${index:-index.tsv}"
+        done < "$FWUPDATE_SOURCES_FILE"
+    fi
+
+    [ -s "$CATALOG" ] || fw_die "no compatible firmware was found in the configured HTTP sources"
+    printf '\nAvailable MS42/MS42P firmware:\n'
+    awk -F'|' '{printf "  %d) %-18s %-20s %-42s %s\n", NR, $1, $3, $4, $6}' "$CATALOG"
+    printf '\n'
+    [ "$MODE" = list ] && exit 0
+
+    if [ -n "$CHOICE" ]; then
+        case "$CHOICE" in ''|*[!0-9]*) fw_die "--choice must be a positive integer" ;; esac
+        selected=$(awk -F'|' -v n="$CHOICE" 'NR == n {print; exit}' "$CATALOG")
+    elif [ -n "$SELECT_FILE" ]; then
+        selected=$(awk -F'|' -v f="$SELECT_FILE" '$4 == f {print; exit}' "$CATALOG")
+    elif [ -n "$VERSION" ]; then
+        selected=$(awk -F'|' -v v="$VERSION" '$3 == v {print; exit}' "$CATALOG")
+    else
+        [ -t 0 ] || fw_die "headless mode requires --choice, --version, --file, or --url"
+        printf 'Select firmware number: '
+        read -r CHOICE
+        case "$CHOICE" in ''|*[!0-9]*) fw_die "selection must be a positive integer" ;; esac
+        selected=$(awk -F'|' -v n="$CHOICE" 'NR == n {print; exit}' "$CATALOG")
+    fi
+    [ -n "${selected:-}" ] || fw_die "the requested catalog entry was not found"
+    IFS='|' read -r selected_name selected_base selected_version filename expected_size description <<EOF_SELECTED
+$selected
+EOF_SELECTED
+    selected_source="$selected_name:$selected_base"
+    firmware_url=$(join_url "$selected_base" "$filename")
+    checksum_url="$firmware_url.sha256"
+fi
+
+FWUPDATE_SOURCE=$selected_source
+FWUPDATE_FIRMWARE=$filename
+export FWUPDATE_SOURCE FWUPDATE_FIRMWARE
+status_write downloading firmware 8 "Downloading $filename" "$selected_source" "$filename"
+local_fw="$WORK/$filename"
+local_sha="$WORK/$filename.sha256"
+fetch_http_file "$firmware_url" "$local_fw"
+status_write downloading checksum 12 "Downloading $filename.sha256" "$selected_source" "$filename"
+fetch_http_file "$checksum_url" "$local_sha"
+
+if [ -n "${expected_size:-}" ] && printf '%s' "$expected_size" | grep -Eq '^[0-9]+$'; then
+    actual_size=$(file_size "$local_fw")
+    [ "$actual_size" -eq "$expected_size" ] || fw_die "downloaded size $actual_size does not match catalog size $expected_size"
+fi
+
+set -- fw_update --checksum "$local_sha" --overlay "$OVERLAY" --source "$selected_source"
+[ -n "${selected_version:-}" ] && set -- "$@" --version "$selected_version"
+[ "$YES" -eq 1 ] && set -- "$@" --yes
+[ "$FORCE" -eq 1 ] && set -- "$@" --force
+[ "$VERIFY_ONLY" -eq 1 ] && set -- "$@" --verify-only
+[ "$DRY_RUN" -eq 1 ] && set -- "$@" --dry-run
+set -- "$@" "$local_fw"
+trap - EXIT
+exec "$@"
