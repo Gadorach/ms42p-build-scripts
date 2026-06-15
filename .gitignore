@@ -1,0 +1,32 @@
+# Downloaded source and work trees
+downloads/
+sources/
+work/
+cache/
+
+# Buildroot and OpenWrt output
+buildroot-*/output/
+openwrt-*/build_dir/
+openwrt-*/staging_dir/
+openwrt-*/bin/
+
+# Firmware artifacts
+artifacts/
+*.bin
+*.img
+*.rom
+*.squashfs
+*.jffs2
+*.ubi
+*.ubifs
+*.ko
+
+# UI dependencies and output
+node_modules/
+build/
+dist/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
