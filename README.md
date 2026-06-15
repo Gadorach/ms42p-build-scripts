@@ -1,4 +1,4 @@
-# MS42P reproducible PostmerkOS build scripts — revision 12
+# MS42P reproducible PostmerkOS build scripts - NOTE: Written by GPT with minimal oversight. Human verified outputs.
 
 This staged workflow targets an MS42/MS42P and deliberately uses Buildroot **2023.02.4**. It builds a compressed `vmlinuz`, imports the known-good donor `/etc` regular files and complete `/lib/modules`, builds `rootfs.squashfs`, and packs a 16 MiB NOR image without renaming artifacts to `vmlinux` or `bootubi.new`.
 
